@@ -1,0 +1,20 @@
+*** Starting wc test.
+unexpected EOF
+--- wc test: PASS
+*** Starting indexer test.
+--- indexer test: PASS
+*** Starting map parallelism test.
+--- map parallelism test: PASS
+*** Starting reduce parallelism test.
+unexpected EOF
+--- reduce parallelism test: PASS
+*** Starting job count test.
+--- job count test: PASS
+*** Starting early exit test.
+unexpected EOF
+--- output changed after first worker exited
+--- early exit test: FAIL
+*** Starting crash test.
+read unix @->/var/tmp/824-mr-1000: read: connection reset by peer
+--- crash test: PASS
+*** FAILED SOME TESTS
