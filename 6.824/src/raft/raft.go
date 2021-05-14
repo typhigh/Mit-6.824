@@ -18,15 +18,15 @@ package raft
 //
 
 import (
-	"flag"
-	"go/ast"
-	"image"
-	"io"
+//	"flag"
+//	"go/ast"
+//	"image"
+//	"io"
 	"log"
 	"math/rand"
 	"os"
 	"strconv"
-	"syscall"
+//	"syscall"
 	"time"
 
 	//	"bytes"
@@ -104,7 +104,7 @@ func (rf *Raft) GetState() (int, bool) {
 	// Your code here (2A).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	return rf.currentTerm, rf.state == Leader
+	return rf.currentTerm, atomic.LoadInt32((*int32)(&rf.state)) == int32(Leader)
 }
 
 //
@@ -172,8 +172,8 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
-	term			int
-	candidateId		int
+	Term			int
+	CandidateId		int
 }
 
 // RequestVoteReply
@@ -182,8 +182,8 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
-	term 			int
-	voteGranted		bool
+	Term 			int
+	VoteGranted		bool
 }
 
 // RequestVote
@@ -193,15 +193,15 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	reply.term = rf.currentTerm
-	if rf.currentTerm < args.term ||
-		(rf.currentTerm == args.term && (rf.votedFor == -1 || rf.votedFor == args.candidateId)) {
-		rf.follow(args.candidateId, args.term)
-		reply.term = rf.currentTerm
-		reply.voteGranted = true
+	reply.Term = rf.currentTerm
+	reply.VoteGranted = false
+	rf.logWriter.Printf("debug: request with term [%d], and current term [%d]", args.Term, rf.currentTerm)
+	if rf.currentTerm < args.Term ||
+		(rf.currentTerm == args.Term && (rf.votedFor == -1 || rf.votedFor == args.CandidateId)) {
+		rf.follow(args.CandidateId, args.Term)
+		reply.VoteGranted = true
 		return
 	}
-	reply.voteGranted = false
 }
 
 //
@@ -238,6 +238,33 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
+type AppendEntriesArgs struct {
+	Term 		int
+	LeaderId	int
+}
+
+type AppendEntriesReply struct {
+	Term 		int
+	Success		bool
+}
+
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	reply.Term = rf.currentTerm
+	if rf.currentTerm > args.Term {
+		// leader's term is old
+		reply.Success = false
+		return
+	}
+	rf.follow(args.LeaderId, args.Term)
+	reply.Success = true
+}
+
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	return ok
+}
 // Start
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
@@ -314,25 +341,26 @@ func (rf *Raft) ticker() {
 
 func (rf *Raft) updateState(state State) {
 	oldState := rf.state
-	rf.state = state
+	atomic.StoreInt32((*int32)(&rf.state), int32(state))
 	switch state {
 	case Leader:
 		rf.electionTimer.Stop()
 		rf.heartbeatTimer.Reset(HeartbeatInterval)
 	case Follower:
 		rf.heartbeatTimer.Stop()
-		rf.electionTimer.Reset(randomElectionTimeout(ElectionTimeoutLower, ElectionTimeoutUpper))\
+		rf.electionTimer.Reset(randomElectionTimeout(ElectionTimeoutLower, ElectionTimeoutUpper))
 	case Candidate:
 		rf.heartbeatTimer.Stop()
 		rf.startElection()
 		rf.electionTimer.Reset(randomElectionTimeout(ElectionTimeoutLower, ElectionTimeoutUpper))
 	}
-	rf.logWriter.Printf("raft[%d] update state from [%s] to [%s]", rf.me, oldState.String(), state.String())
+	rf.logWriter.Printf("update state from [%s] to [%s]", oldState.String(), rf.state.String())
 }
 
 func (rf *Raft) startElection() {
 	rf.votedFor = rf.me
 	rf.currentTerm++
+	rf.logWriter.Printf("start election with term[%d]", rf.currentTerm)
 	args := RequestVoteArgs{
 		rf.currentTerm,
 		rf.me,
@@ -340,30 +368,37 @@ func (rf *Raft) startElection() {
 	var nVoteGranted int32
 	var nVotNotGranted int32
 	var electFinished int32 	// finished 1, not 0
+	nVoteGranted = 1
 	electFinished = 0
+	if len(rf.peers) == 1 {
+		rf.updateState(Leader)
+		return
+	}
+
 	for server := range rf.peers {
 		if server == rf.me {
 			continue
 		}
 		go func(server int) {
-			if atomic.LoadInt32(&electFinished) == 1 || rf.state == Leader {
+			if atomic.LoadInt32(&electFinished) == 1 ||
+				atomic.LoadInt32((*int32)(&rf.state)) == int32(Leader) {
 				return
 			}
 			reply := RequestVoteReply{}
 			if !rf.sendRequestVote(server, &args, &reply) {
 				return
 			}
-			if reply.voteGranted {
+			if reply.VoteGranted {
 				atomic.AddInt32(&nVoteGranted, 1)
 			} else {
 				atomic.AddInt32(&nVotNotGranted, 1)
 			}
 
-			if atomic.LoadInt32(&electFinished) == 1 || rf.state == Leader {
+			if atomic.LoadInt32(&electFinished) == 1 || atomic.LoadInt32((*int32)(&rf.state)) == int32(Leader) {
 				return
 			}
 			nVote := int32(len(rf.peers))
-			nMinLeaderVote := int32(len(rf.peers)) + 1
+			nMinLeaderVote := int32(len(rf.peers))/2 + 1
 			if atomic.LoadInt32(&nVoteGranted) >= nMinLeaderVote {
 				atomic.StoreInt32(&electFinished, 1)
 				rf.mu.Lock()
@@ -380,11 +415,31 @@ func (rf *Raft) startElection() {
 }
 
 func (rf *Raft) broadcastHeartbeat() {
-
+	for server := range rf.peers {
+		if rf.me == server {
+			continue
+		}
+		args := AppendEntriesArgs{
+			rf.currentTerm,
+			rf.me,
+		}
+		go func(server int) {
+			reply := AppendEntriesReply{}
+			if rf.sendAppendEntries(server, &args, &reply) {
+				if reply.Success == false {
+					rf.mu.Lock()
+					defer rf.mu.Unlock()
+					rf.follow(-1, reply.Term)
+					return
+				}
+			}
+		}(server)
+	}
 }
 
 func (rf *Raft) follow(id int, term int) {
 	rf.votedFor = id
+	rf.currentTerm = term
 	rf.updateState(Follower)
 }
 
@@ -411,12 +466,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf := &Raft{}
 	rf.peers = peers
 	rf.persister = persister
-	rf.me = -1
+	rf.me = me
 	rf.state = Follower
-	rf.votedFor = rf.me
+	rf.votedFor = -1
 	rf.currentTerm = 0
-	rf.electionTimer = new(time.Timer)
-	rf.heartbeatTimer = new(time.Timer)
+	rf.electionTimer = time.NewTimer(randomElectionTimeout(ElectionTimeoutLower, ElectionTimeoutUpper))
+	rf.heartbeatTimer = time.NewTimer(HeartbeatInterval)
+	rf.heartbeatTimer.Stop()
 	rf.logWriter = log.Logger{}
 	logFile, _ := os.Create("log" + strconv.Itoa(rf.me))
 	rf.logWriter.SetOutput(logFile)
