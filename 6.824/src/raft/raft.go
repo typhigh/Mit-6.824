@@ -18,7 +18,9 @@ package raft
 //
 
 import (
-//	"flag"
+	"index/suffixarray"
+
+	//	"flag"
 //	"go/ast"
 //	"image"
 //	"io"
@@ -77,6 +79,13 @@ const (
 	ElectionTimeoutLower 	=	time.Millisecond * 150  // 150 ms
 	ElectionTimeoutUpper	= 	time.Millisecond * 300  // 300 ms
 )
+
+type LogEntry struct {
+	Command interface{}
+	Term    int
+	Index   int
+}
+
 // Raft
 // A Go object implementing a single Raft peer.
 //
@@ -96,6 +105,12 @@ type Raft struct {
 	electionTimer		*time.Timer
 	heartbeatTimer		*time.Timer
 	logWriter			log.Logger
+
+	log					[]LogEntry
+	commitIndex			int
+	lastApplied			int
+	nextIndex			[]int
+	matchIndex			[]int
 }
 
 // GetState return currentTerm and whether this server
@@ -174,6 +189,8 @@ type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
 	Term			int
 	CandidateId		int
+	LastLogIndex	int
+	LastLogTerm		int
 }
 
 // RequestVoteReply
@@ -196,11 +213,17 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	reply.Term = rf.currentTerm
 	reply.VoteGranted = false
 	rf.logWriter.Printf("debug: request with term [%d], and current term [%d]", args.Term, rf.currentTerm)
-	if rf.currentTerm < args.Term ||
-		(rf.currentTerm == args.Term && (rf.votedFor == -1 || rf.votedFor == args.CandidateId)) {
-		rf.follow(args.CandidateId, args.Term)
+	if rf.currentTerm < args.Term {
+		reply.VoteGranted = true
+	}
+	if rf.currentTerm == args.Term &&
+	(rf.votedFor == -1 || rf.votedFor == args.CandidateId) &&
+	rf.IsNewer(args.LastLogTerm, args.LastLogIndex) {
 		reply.VoteGranted = true
 		return
+	}
+	if reply.VoteGranted {
+		rf.follow(args.CandidateId, args.Term)
 	}
 }
 
@@ -239,8 +262,12 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 }
 
 type AppendEntriesArgs struct {
-	Term 		int
-	LeaderId	int
+	Term 			int
+	LeaderId		int
+	PrevLogIndex	int
+	PrevLogTerm		int
+	Entries 		[]LogEntry
+	LeaderCommit	int
 }
 
 type AppendEntriesReply struct {
@@ -257,6 +284,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Success = false
 		return
 	}
+
+	prevLogEntry := rf.getLogEntry(args.PrevLogIndex)
+	if prevLogEntry == nil || prevLogEntry.Term != args.PrevLogTerm {
+		reply.Success = false
+		return
+	}
+
+
 	rf.follow(args.LeaderId, args.Term)
 	reply.Success = true
 }
@@ -339,6 +374,7 @@ func (rf *Raft) ticker() {
 	}
 }
 
+
 func (rf *Raft) updateState(state State) {
 	oldState := rf.state
 	atomic.StoreInt32((*int32)(&rf.state), int32(state))
@@ -361,9 +397,12 @@ func (rf *Raft) startElection() {
 	rf.votedFor = rf.me
 	rf.currentTerm++
 	rf.logWriter.Printf("start election with term[%d]", rf.currentTerm)
+	lastLog := rf.getLastLogEntry()
 	args := RequestVoteArgs{
 		rf.currentTerm,
 		rf.me,
+		lastLog.Index,
+		lastLog.Term,
 	}
 	var nVoteGranted int32
 	var nVotNotGranted int32
@@ -419,9 +458,17 @@ func (rf *Raft) broadcastHeartbeat() {
 		if rf.me == server {
 			continue
 		}
+		lastLogIndex := rf.getLastLogEntry().Index
+		prevLogIndex := rf.nextIndex[server] - 1
+		entries := rf.getLogEntries(prevLogIndex + 1, lastLogIndex)
+		copy(entries, rf.log[prevLogIndex+1:])
 		args := AppendEntriesArgs{
 			rf.currentTerm,
 			rf.me,
+			prevLogIndex,
+			rf.getLogEntry(prevLogIndex).Term,
+			rf.getLogEntries(prevLogIndex+1, lastLogIndex),
+			rf.commitIndex,
 		}
 		go func(server int) {
 			reply := AppendEntriesReply{}
@@ -441,6 +488,36 @@ func (rf *Raft) follow(id int, term int) {
 	rf.votedFor = id
 	rf.currentTerm = term
 	rf.updateState(Follower)
+}
+
+func (rf *Raft) IsNewer(term int, index int) bool {
+
+}
+
+func (rf *Raft) getLastLogEntry() *LogEntry {
+	// need locked; return pointer avoid copy
+	length := len(rf.log)
+	if length == 0 {
+		return nil
+	}
+	return &rf.log[length-1]
+}
+
+func (rf *Raft) getLogEntry(index int) *LogEntry{
+	baseIndex := rf.log[0].Index
+	if baseIndex > index {
+		return nil
+	}
+	return &rf.log[index]
+}
+
+func (rf *Raft) getLogEntries(from int, to int) []LogEntry {
+	if from > to {
+		return nil
+	}
+	entries := make([]LogEntry, to - from + 1)
+	copy(entries, rf.log[from:to+1])
+	return entries
 }
 
 func randomElectionTimeout(lower time.Duration, upper time.Duration) time.Duration {
