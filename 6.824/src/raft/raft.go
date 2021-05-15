@@ -216,12 +216,12 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if rf.currentTerm < args.Term {
 		reply.VoteGranted = true
 	}
-	if rf.currentTerm == args.Term &&
-	(rf.votedFor == -1 || rf.votedFor == args.CandidateId) &&
-	rf.IsNewer(args.LastLogTerm, args.LastLogIndex) {
-		reply.VoteGranted = true
-		return
+	if rf.currentTerm == args.Term && (rf.votedFor == -1 || rf.votedFor == args.CandidateId) {
+		// check if candidate's log is at least as up-to-date as rf's
+		lastLog := rf.getLastLogEntry()
+		reply.VoteGranted = args.Term > lastLog.Term || (args.Term == lastLog.Term && args.LastLogIndex > lastLog.Index)
 	}
+
 	if reply.VoteGranted {
 		rf.follow(args.CandidateId, args.Term)
 	}
@@ -279,21 +279,41 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	reply.Term = rf.currentTerm
+
+	// rule 1:
 	if rf.currentTerm > args.Term {
 		// leader's term is old
 		reply.Success = false
 		return
 	}
 
+	// rule 2:
 	prevLogEntry := rf.getLogEntry(args.PrevLogIndex)
 	if prevLogEntry == nil || prevLogEntry.Term != args.PrevLogTerm {
 		reply.Success = false
 		return
 	}
 
+	// heartbeat
+	entries := args.Entries
+	if entries == nil {
+		reply.Success = true
+		return
+	}
 
+	rf.doAppendEntries(entries)
 	rf.follow(args.LeaderId, args.Term)
 	reply.Success = true
+	if args.LeaderCommit > rf.commitIndex {
+		rf.commitIndex = min(args.LeaderCommit, GetLastLogEntry(entries).Index)
+	}
+}
+
+func min(lhs int, rhs int) int {
+	if lhs < rhs {
+		return lhs
+	}
+	return rhs
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -369,11 +389,9 @@ func (rf *Raft) ticker() {
 				rf.heartbeatTimer.Stop()
 			}
 			rf.mu.Unlock()
-
 		}
 	}
 }
-
 
 func (rf *Raft) updateState(state State) {
 	oldState := rf.state
@@ -496,7 +514,11 @@ func (rf *Raft) IsNewer(term int, index int) bool {
 
 func (rf *Raft) getLastLogEntry() *LogEntry {
 	// need locked; return pointer avoid copy
-	length := len(rf.log)
+	return GetLastLogEntry(rf.log)
+}
+
+func GetLastLogEntry(log []LogEntry) *LogEntry {
+	length := len(log)
 	if length == 0 {
 		return nil
 	}
@@ -504,20 +526,29 @@ func (rf *Raft) getLastLogEntry() *LogEntry {
 }
 
 func (rf *Raft) getLogEntry(index int) *LogEntry{
-	baseIndex := rf.log[0].Index
+	return GetLogEntry(rf.log, index)
+}
+
+func GetLogEntry(log []LogEntry, index int) *LogEntry {
+	baseIndex := log[0].Index
 	if baseIndex > index {
 		return nil
 	}
-	return &rf.log[index]
+	return &log[index]
 }
 
 func (rf *Raft) getLogEntries(from int, to int) []LogEntry {
+	// TODO from, to should be index but not array index
 	if from > to {
 		return nil
 	}
 	entries := make([]LogEntry, to - from + 1)
 	copy(entries, rf.log[from:to+1])
 	return entries
+}
+
+func (rf *Raft) doAppendEntries(entries []LogEntry) {
+	// TODO add some codes here
 }
 
 func randomElectionTimeout(lower time.Duration, upper time.Duration) time.Duration {
