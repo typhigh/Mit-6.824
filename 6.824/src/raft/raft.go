@@ -99,18 +99,19 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-	currentTerm			int
-	votedFor			int
-	state 				State
-	electionTimer		*time.Timer
-	heartbeatTimer		*time.Timer
-	logWriter			log.Logger
+	applyCh     chan ApplyMsg
+	currentTerm    int
+	votedFor       int
+	state          State
+	electionTimer  *time.Timer
+	heartbeatTimer *time.Timer
+	logWriter      log.Logger
 
-	log					[]LogEntry
-	commitIndex			int
-	lastApplied			int
-	nextIndex			[]int
-	matchIndex			[]int
+	log         []LogEntry
+	commitIndex int
+	lastApplied int
+	nextIndex   []int
+	matchIndex  []int
 }
 
 // GetState return currentTerm and whether this server
@@ -301,12 +302,16 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
+	// rule 3, 4
 	rf.doAppendEntries(entries)
 	rf.follow(args.LeaderId, args.Term)
 	reply.Success = true
+
+	// rule 5
 	if args.LeaderCommit > rf.commitIndex {
 		rf.commitIndex = min(args.LeaderCommit, GetLastLogEntry(entries).Index)
 	}
+	go rf.applySync()
 }
 
 func min(lhs int, rhs int) int {
@@ -478,8 +483,6 @@ func (rf *Raft) broadcastHeartbeat() {
 		}
 		lastLogIndex := rf.getLastLogEntry().Index
 		prevLogIndex := rf.nextIndex[server] - 1
-		entries := rf.getLogEntries(prevLogIndex + 1, lastLogIndex)
-		copy(entries, rf.log[prevLogIndex+1:])
 		args := AppendEntriesArgs{
 			rf.currentTerm,
 			rf.me,
@@ -508,10 +511,6 @@ func (rf *Raft) follow(id int, term int) {
 	rf.updateState(Follower)
 }
 
-func (rf *Raft) IsNewer(term int, index int) bool {
-
-}
-
 func (rf *Raft) getLastLogEntry() *LogEntry {
 	// need locked; return pointer avoid copy
 	return GetLastLogEntry(rf.log)
@@ -522,7 +521,7 @@ func GetLastLogEntry(log []LogEntry) *LogEntry {
 	if length == 0 {
 		return nil
 	}
-	return &rf.log[length-1]
+	return &log[length-1]
 }
 
 func (rf *Raft) getLogEntry(index int) *LogEntry{
@@ -530,25 +529,57 @@ func (rf *Raft) getLogEntry(index int) *LogEntry{
 }
 
 func GetLogEntry(log []LogEntry, index int) *LogEntry {
-	baseIndex := log[0].Index
-	if baseIndex > index {
+	idxInLog := index - log[0].Index
+	if idxInLog < 0  || idxInLog >= len(log){
 		return nil
 	}
-	return &log[index]
+	return &log[idxInLog]
 }
 
 func (rf *Raft) getLogEntries(from int, to int) []LogEntry {
-	// TODO from, to should be index but not array index
+	begin := from - rf.log[0].Index
+	end := to - rf.log[0].Index + 1
 	if from > to {
 		return nil
 	}
-	entries := make([]LogEntry, to - from + 1)
-	copy(entries, rf.log[from:to+1])
+	entries := make([]LogEntry, end - begin)
+	copy(entries, rf.log[begin:end])
 	return entries
+}
+
+func (rf *Raft) deleteLogEntries(index int) {
+	// delete log entries from index
+	idxInLog := index - rf.log[0].Index
+	rf.log = rf.log[0:idxInLog]
 }
 
 func (rf *Raft) doAppendEntries(entries []LogEntry) {
 	// TODO add some codes here
+	if len(entries) == 0 {
+		return
+	}
+
+	for i := range entries {
+		index, term := entries[i].Index, entries[i].Term
+		if rf.getLogEntry(index).Term != term {
+			rf.deleteLogEntries(index)
+			rf.log = append(rf.log, entries[i:]...)
+			return
+		}
+	}
+}
+
+func (rf *Raft) applySync() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	for index := rf.lastApplied + 1; index <= rf.commitIndex; index++ {
+		applyMsg := ApplyMsg{}
+		applyMsg.Command = rf.getLogEntry(index)
+		applyMsg.CommandIndex = index
+		applyMsg.CommandValid = true
+		rf.applyCh <- applyMsg
+		rf.lastApplied = index
+	}
 }
 
 func randomElectionTimeout(lower time.Duration, upper time.Duration) time.Duration {
@@ -575,6 +606,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
+	rf.applyCh = applyCh
 	rf.state = Follower
 	rf.votedFor = -1
 	rf.currentTerm = 0
