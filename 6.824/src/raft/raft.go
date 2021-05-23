@@ -18,8 +18,6 @@ package raft
 //
 
 import (
-	"index/suffixarray"
-
 	//	"flag"
 //	"go/ast"
 //	"image"
@@ -341,12 +339,17 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index := -1
-	term := -1
-	isLeader := true
 
 	// Your code here (2B).
-
-
+	term, isLeader := rf.GetState()
+	if isLeader {
+		rf.mu.Lock()
+		defer rf.mu.Unlock()
+		index = rf.getLastLogEntry().Index + 1
+		rf.log = append(rf.log, LogEntry{command, term, index})
+		rf.matchIndex[rf.me] = index
+		rf.nextIndex[rf.me] = index + 1
+	}
 	return index, term, isLeader
 }
 
@@ -403,6 +406,11 @@ func (rf *Raft) updateState(state State) {
 	atomic.StoreInt32((*int32)(&rf.state), int32(state))
 	switch state {
 	case Leader:
+		// old state not leader
+		for i := 0; i < len(rf.peers); i++ {
+			rf.matchIndex[i] = 0
+			rf.nextIndex[i] = rf.getLastLogEntry().Index + 1
+		}
 		rf.electionTimer.Stop()
 		rf.heartbeatTimer.Reset(HeartbeatInterval)
 	case Follower:
@@ -493,13 +501,22 @@ func (rf *Raft) broadcastHeartbeat() {
 		}
 		go func(server int) {
 			reply := AppendEntriesReply{}
-			if rf.sendAppendEntries(server, &args, &reply) {
-				if reply.Success == false {
-					rf.mu.Lock()
-					defer rf.mu.Unlock()
+			if !rf.sendAppendEntries(server, &args, &reply) {
+				return
+			}
+			if reply.Success == false {
+				rf.mu.Lock()
+				defer rf.mu.Unlock()
+				if reply.Term <= rf.currentTerm {
+					if rf.nextIndex[server] - 1 == prevLogIndex {
+						// nextIndex is not changed (valid), back
+						// TODO : can optimize
+						rf.nextIndex[server] = prevLogIndex - 1
+					}
+				} else {
 					rf.follow(-1, reply.Term)
-					return
 				}
+				return
 			}
 		}(server)
 	}
@@ -537,6 +554,7 @@ func GetLogEntry(log []LogEntry, index int) *LogEntry {
 }
 
 func (rf *Raft) getLogEntries(from int, to int) []LogEntry {
+	// [from, to] => [begin, end)
 	begin := from - rf.log[0].Index
 	end := to - rf.log[0].Index + 1
 	if from > to {
@@ -561,7 +579,7 @@ func (rf *Raft) doAppendEntries(entries []LogEntry) {
 
 	for i := range entries {
 		index, term := entries[i].Index, entries[i].Term
-		if rf.getLogEntry(index).Term != term {
+		if logEntry := rf.getLogEntry(index); logEntry == nil || logEntry.Term != term {
 			rf.deleteLogEntries(index)
 			rf.log = append(rf.log, entries[i:]...)
 			return
@@ -614,6 +632,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.heartbeatTimer = time.NewTimer(HeartbeatInterval)
 	rf.heartbeatTimer.Stop()
 	rf.logWriter = log.Logger{}
+
+	rf.log = make([]LogEntry, 1)
+	rf.log[0].Index = 0
+
+	rf.matchIndex = make([]int, len(rf.peers))
+	rf.nextIndex = make([]int, len(rf.peers))
+
 	logFile, _ := os.Create("log" + strconv.Itoa(rf.me))
 	rf.logWriter.SetOutput(logFile)
 
