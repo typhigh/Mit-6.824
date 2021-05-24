@@ -211,7 +211,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	defer rf.mu.Unlock()
 	reply.Term = rf.currentTerm
 	reply.VoteGranted = false
-	rf.logWriter.Printf("debug: request with term [%d], and current term [%d]", args.Term, rf.currentTerm)
+	// rf.logWriter.Printf("debug: request with term [%d], and current term [%d]", args.Term, rf.currentTerm)
 	if rf.currentTerm < args.Term {
 		reply.VoteGranted = true
 	}
@@ -292,23 +292,20 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Success = false
 		return
 	}
-
-	// heartbeat
+	// now reply must be true
+	// skip heartbeat
 	entries := args.Entries
-	if entries == nil {
-		reply.Success = true
-		return
+	if entries != nil && len(entries) != 0 {
+		// rule 3, 4
+		rf.doAppendEntries(entries)
 	}
-
-	// rule 3, 4
-	rf.doAppendEntries(entries)
-	rf.follow(args.LeaderId, args.Term)
-	reply.Success = true
 
 	// rule 5
 	if args.LeaderCommit > rf.commitIndex {
 		rf.commitIndex = min(args.LeaderCommit, GetLastLogEntry(entries).Index)
 	}
+	reply.Success = true
+	rf.follow(args.LeaderId, args.Term)
 	go rf.applySync()
 }
 
@@ -464,7 +461,7 @@ func (rf *Raft) startElection() {
 				atomic.AddInt32(&nVotNotGranted, 1)
 			}
 
-			if atomic.LoadInt32(&electFinished) == 1 || atomic.LoadInt32((*int32)(&rf.state)) == int32(Leader) {
+			if atomic.LoadInt32(&electFinished) == 1 {
 				return
 			}
 			nVote := int32(len(rf.peers))
@@ -473,8 +470,10 @@ func (rf *Raft) startElection() {
 				atomic.StoreInt32(&electFinished, 1)
 				rf.mu.Lock()
 				defer rf.mu.Unlock()
-				// ensure update leader exactly once
-				rf.updateState(Leader)
+				if atomic.LoadInt32((*int32)(&rf.state)) != int32(Leader) {
+					// ensure update leader exactly once
+					rf.updateState(Leader)
+				}
 				return
 			}
 			if nVote - atomic.LoadInt32(&nVotNotGranted) < nMinLeaderVote {
@@ -523,9 +522,12 @@ func (rf *Raft) broadcastHeartbeat() {
 }
 
 func (rf *Raft) follow(id int, term int) {
-	rf.votedFor = id
-	rf.currentTerm = term
-	rf.updateState(Follower)
+	if atomic.LoadInt32((*int32)(&rf.state)) != int32(Follower) || rf.votedFor == id {
+		rf.logWriter.Printf("follow [%d] with term[%d]", id, term)
+		rf.votedFor = id
+		rf.currentTerm = term
+		rf.updateState(Follower)
+	}
 }
 
 func (rf *Raft) getLastLogEntry() *LogEntry {
