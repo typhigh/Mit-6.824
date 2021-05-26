@@ -211,14 +211,17 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	defer rf.mu.Unlock()
 	reply.Term = rf.currentTerm
 	reply.VoteGranted = false
-	// rf.logWriter.Printf("debug: request with term [%d], and current term [%d]", args.Term, rf.currentTerm)
-	if rf.currentTerm < args.Term {
-		reply.VoteGranted = true
+	rf.logWriter.Printf("debug: request with term [%d], and current term [%d], rf voteFor[%d]", args.Term, rf.currentTerm, rf.votedFor)
+	if rf.currentTerm > args.Term {
+		reply.VoteGranted = false
+	} else if rf.currentTerm < args.Term {
+		rf.follow(-1, args.Term)
 	}
-	if rf.currentTerm == args.Term && (rf.votedFor == -1 || rf.votedFor == args.CandidateId) {
+
+	if rf.currentTerm <= args.Term && (rf.votedFor == -1 || rf.votedFor == args.CandidateId) {
 		// check if candidate's log is at least as up-to-date as rf's
 		lastLog := rf.getLastLogEntry()
-		reply.VoteGranted = args.Term > lastLog.Term || (args.Term == lastLog.Term && args.LastLogIndex > lastLog.Index)
+		reply.VoteGranted = args.LastLogTerm > lastLog.Term || (args.LastLogTerm == lastLog.Term && args.LastLogIndex >= lastLog.Index)
 	}
 
 	if reply.VoteGranted {
@@ -277,7 +280,7 @@ type AppendEntriesReply struct {
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	rf.logWriter.Printf("debug get append entries with[%v]", args.Entries)
+	// rf.logWriter.Printf("debug get append entries with[%v]", args.Entries)
 	reply.Term = rf.currentTerm
 
 	// rule 1:
@@ -435,9 +438,7 @@ func (rf *Raft) startElection() {
 	}
 	var nVoteGranted int32
 	var nVotNotGranted int32
-	var electFinished int32 	// finished 1, not 0
 	nVoteGranted = 1
-	electFinished = 0
 	if len(rf.peers) == 1 {
 		rf.updateState(Leader)
 		return
@@ -448,8 +449,7 @@ func (rf *Raft) startElection() {
 			continue
 		}
 		go func(server int) {
-			if atomic.LoadInt32(&electFinished) == 1 ||
-				atomic.LoadInt32((*int32)(&rf.state)) == int32(Leader) {
+			if atomic.LoadInt32((*int32)(&rf.state)) != int32(Candidate) {
 				return
 			}
 			reply := RequestVoteReply{}
@@ -459,16 +459,17 @@ func (rf *Raft) startElection() {
 			if reply.VoteGranted {
 				atomic.AddInt32(&nVoteGranted, 1)
 			} else {
+				rf.mu.Lock()
+				if rf.currentTerm < reply.Term {
+					rf.follow(-1, reply.Term)
+				}
 				atomic.AddInt32(&nVotNotGranted, 1)
+				rf.mu.Unlock()
 			}
 
-			if atomic.LoadInt32(&electFinished) == 1 {
-				return
-			}
 			nVote := int32(len(rf.peers))
 			nMinLeaderVote := int32(len(rf.peers))/2 + 1
 			if atomic.LoadInt32(&nVoteGranted) >= nMinLeaderVote {
-				atomic.StoreInt32(&electFinished, 1)
 				rf.mu.Lock()
 				defer rf.mu.Unlock()
 				if atomic.LoadInt32((*int32)(&rf.state)) != int32(Leader) {
@@ -478,7 +479,9 @@ func (rf *Raft) startElection() {
 				return
 			}
 			if nVote - atomic.LoadInt32(&nVotNotGranted) < nMinLeaderVote {
-				atomic.StoreInt32(&electFinished, 1)
+				rf.mu.Lock()
+				defer rf.mu.Unlock()
+				rf.follow(-1, rf.currentTerm)
 			}
 		}(server)
 	}
@@ -533,7 +536,7 @@ func (rf *Raft) broadcastHeartbeat() {
 }
 
 func (rf *Raft) follow(id int, term int) {
-	if atomic.LoadInt32((*int32)(&rf.state)) != int32(Follower) || rf.votedFor != id {
+	if atomic.LoadInt32((*int32)(&rf.state)) != int32(Follower) || rf.votedFor != id || rf.currentTerm != term {
 		rf.logWriter.Printf("follow [%d] by term[%d]", id, term)
 		rf.votedFor = id
 		rf.currentTerm = term
@@ -613,7 +616,7 @@ func (rf *Raft) applySync() {
 		// TODO : applyMsg is not complete
 		rf.applyCh <- applyMsg
 		rf.lastApplied = index
-		rf.logWriter.Printf("apply msg index[%d], command[%v]", index, applyMsg.Command)
+		rf.logWriter.Printf("apply msg index[%d], command [%v]", index, applyMsg.Command)
 	}
 }
 
@@ -694,7 +697,12 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.matchIndex = make([]int, len(rf.peers))
 	rf.nextIndex = make([]int, len(rf.peers))
 
-	logFile, _ := os.Create("raft" + strconv.Itoa(rf.me) + ".log")
+	logFileName := "raft" + strconv.Itoa(rf.me) + "_log.txt"
+	os.Remove(logFileName)
+	logFile, _ := os.OpenFile(logFileName, os.O_CREATE|os.O_RDWR, 0777)
+
+
+	rf.logWriter.SetFlags(log.Lmicroseconds | log.Lshortfile)
 	rf.logWriter.SetOutput(logFile)
 
 	// Your initialization code here (2A, 2B, 2C).
