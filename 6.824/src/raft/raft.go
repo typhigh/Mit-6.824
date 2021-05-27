@@ -294,6 +294,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	prevLogEntry := rf.getLogEntry(args.PrevLogIndex)
 	if prevLogEntry == nil || prevLogEntry.Term != args.PrevLogTerm {
 		reply.Success = false
+		rf.follow(args.LeaderId, args.Term)
 		return
 	}
 	// now reply must be true
@@ -599,9 +600,10 @@ func (rf *Raft) doAppendEntries(entries []LogEntry) {
 		if logEntry := rf.getLogEntry(index); logEntry == nil || logEntry.Term != term {
 			rf.deleteLogEntries(index)
 			rf.log = append(rf.log, entries[i:]...)
-			return
+			break
 		}
 	}
+	rf.logWriter.Printf("after append, last log entry is [%v]", *rf.getLastLogEntry())
 }
 
 func (rf *Raft) applySync() {
