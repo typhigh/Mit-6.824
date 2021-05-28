@@ -118,7 +118,7 @@ func (rf *Raft) GetState() (int, bool) {
 	// Your code here (2A).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	return rf.currentTerm, atomic.LoadInt32((*int32)(&rf.state)) == int32(Leader)
+	return rf.currentTerm, rf.isStateEqual(Leader)
 }
 
 //
@@ -390,7 +390,7 @@ func (rf *Raft) ticker() {
 			rf.mu.Unlock()
 		case <- rf.heartbeatTimer.C:
 			rf.mu.Lock()
-			if rf.state == Leader {
+			if rf.isStateEqual(Leader) {
 				rf.broadcastHeartbeat()
 				rf.heartbeatTimer.Reset(HeartbeatInterval)
 			} else {
@@ -450,7 +450,7 @@ func (rf *Raft) startElection() {
 			continue
 		}
 		go func(server int) {
-			if atomic.LoadInt32((*int32)(&rf.state)) != int32(Candidate) {
+			if !rf.isStateEqual(Candidate) {
 				return
 			}
 			reply := RequestVoteReply{}
@@ -473,7 +473,7 @@ func (rf *Raft) startElection() {
 			if atomic.LoadInt32(&nVoteGranted) >= nMinLeaderVote {
 				rf.mu.Lock()
 				defer rf.mu.Unlock()
-				if atomic.LoadInt32((*int32)(&rf.state)) != int32(Leader) {
+				if !rf.isStateEqual(Leader) {
 					// ensure update leader exactly once
 					rf.updateState(Leader)
 				}
@@ -537,7 +537,7 @@ func (rf *Raft) broadcastHeartbeat() {
 }
 
 func (rf *Raft) follow(id int, term int) {
-	if atomic.LoadInt32((*int32)(&rf.state)) != int32(Follower) || rf.votedFor != id || rf.currentTerm != term {
+	if !rf.isStateEqual(Follower) || rf.votedFor != id || rf.currentTerm != term {
 		rf.logWriter.Printf("follow [%d] by term[%d]", id, term)
 		rf.votedFor = id
 		rf.currentTerm = term
@@ -656,6 +656,10 @@ func (rf *Raft) updateCommitIndex(index int) {
 	rf.logWriter.Printf("update commit index to [%d]", index)
 	rf.commitIndex = index
 
+}
+
+func (rf *Raft) isStateEqual(state State) bool {
+	return atomic.LoadInt32((*int32)(&rf.state)) == int32(state)
 }
 
 func randomElectionTimeout(lower time.Duration, upper time.Duration) time.Duration {
