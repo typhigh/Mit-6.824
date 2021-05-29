@@ -18,6 +18,7 @@ package raft
 //
 
 import (
+	"bytes"
 	//	"flag"
 //	"go/ast"
 //	"image"
@@ -33,7 +34,7 @@ import (
 	"sync"
 	"sync/atomic"
 
-//	"6.824/labgob"
+	"6.824/labgob"
 	"6.824/labrpc"
 )
 
@@ -135,6 +136,14 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
+	wBuffer := new(bytes.Buffer)
+	encoder := labgob.NewEncoder(wBuffer)
+	encoder.Encode(rf.currentTerm)
+	encoder.Encode(rf.votedFor)
+	encoder.Encode(rf.log)
+	data := wBuffer.Bytes()
+	rf.persister.SaveRaftState(data)
+	rf.logWriter.Printf("persist, currentTerm[%d], voteFor[%d], serialize log[%v]", rf.currentTerm, rf.votedFor, rf.log)
 }
 
 
@@ -158,6 +167,21 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+	rBuffer := bytes.NewBuffer(data)
+	decoder := labgob.NewDecoder(rBuffer)
+	var currentTerm int
+	var voteFor 	int
+	var log			[]LogEntry
+	if decoder.Decode(&currentTerm) != nil ||
+		decoder.Decode(&voteFor) != nil ||
+		decoder.Decode(&log) != nil {
+		rf.logWriter.Printf("ERROR, some thing wrong with decoder")
+		os.Exit(0)
+	}
+	rf.currentTerm = currentTerm
+	rf.votedFor = voteFor
+	rf.log = log
+	rf.logWriter.Printf("readPersist, currentTerm[%d], votedFor[%d], log[%v]", rf.currentTerm, rf.votedFor, rf.log)
 }
 
 // CondInstallSnapshot
@@ -227,6 +251,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if reply.VoteGranted {
 		rf.follow(args.CandidateId, args.Term)
 	}
+	rf.persist()
 }
 
 //
@@ -280,7 +305,7 @@ type AppendEntriesReply struct {
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	// rf.logWriter.Printf("debug get append entries with[%v]", args.Entries)
+	rf.logWriter.Printf("debug get append args[%v]", args)
 	reply.Term = rf.currentTerm
 
 	// rule 1:
@@ -295,6 +320,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if prevLogEntry == nil || prevLogEntry.Term != args.PrevLogTerm {
 		reply.Success = false
 		rf.follow(args.LeaderId, args.Term)
+		rf.persist()
 		return
 	}
 	// now reply must be true
@@ -316,6 +342,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Success = true
 	rf.follow(args.LeaderId, args.Term)
 	go rf.applySync()
+	rf.persist()
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -349,6 +376,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		rf.matchIndex[rf.me] = index
 		rf.nextIndex[rf.me] = index + 1
 		rf.logWriter.Printf("leader start command [%v]", command)
+		rf.persist()
 	}
 	return index, term, isLeader
 }
@@ -496,6 +524,7 @@ func (rf *Raft) broadcastHeartbeat() {
 		lastLogIndex := rf.getLastLogEntry().Index
 		prevLogIndex := rf.nextIndex[server] - 1
 		entries := rf.getLogEntries(prevLogIndex+1, lastLogIndex)
+		rf.logWriter.Printf("broadcast heartbeat to raft[%d], prevLogIndex[%d], log[%v]", server, prevLogIndex, rf.log)
 		args := AppendEntriesArgs{
 			rf.currentTerm,
 			rf.me,
@@ -516,7 +545,7 @@ func (rf *Raft) broadcastHeartbeat() {
 					if rf.nextIndex[server] - 1 == prevLogIndex {
 						// nextIndex is not changed (valid), back
 						// TODO : can optimize
-						rf.nextIndex[server] = prevLogIndex - 1
+						rf.nextIndex[server] = prevLogIndex
 					}
 				} else {
 					rf.follow(-1, reply.Term)
@@ -696,10 +725,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.logWriter = log.Logger{}
 	rf.lastApplied = 0
 	rf.commitIndex = 0
-
 	rf.log = make([]LogEntry, 1)
-	rf.log[0].Index = 0
-
+	rf.log[0] = LogEntry {0, 0, 0}
 	rf.matchIndex = make([]int, len(rf.peers))
 	rf.nextIndex = make([]int, len(rf.peers))
 
@@ -716,6 +743,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
+	rf.logWriter.Printf("raft start...")
 	// start ticker goroutine to start elections
 	go rf.ticker()
 
