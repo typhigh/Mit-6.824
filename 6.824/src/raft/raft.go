@@ -19,6 +19,7 @@ package raft
 
 import (
 	"bytes"
+
 	//	"flag"
 //	"go/ast"
 //	"image"
@@ -295,17 +296,24 @@ type AppendEntriesArgs struct {
 	PrevLogTerm		int
 	Entries 		[]LogEntry
 	LeaderCommit	int
+
+	// for debug
+	MessageId			int64
 }
 
 type AppendEntriesReply struct {
-	Term 		int
-	Success		bool
+	Term 				int
+	Success				bool
+
+	// optimize
+	NextLogIndex		int
+	NextLogTerm			int
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	rf.logWriter.Printf("debug get append args[%v]", args)
+	rf.logWriter.Printf("debug, msgId[%d], get append args[%v]", args.MessageId, args)
 	reply.Term = rf.currentTerm
 
 	// rule 1:
@@ -319,6 +327,15 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	prevLogEntry := rf.getLogEntry(args.PrevLogIndex)
 	if prevLogEntry == nil || prevLogEntry.Term != args.PrevLogTerm {
 		reply.Success = false
+		if prevLogEntry == nil {
+			reply.NextLogIndex = rf.getLastLogEntry().Index + 1
+			reply.NextLogTerm = -1
+		} else {
+			rf.logWriter.Printf("debug : prevLogEntry has index[%d] and term[%d]", prevLogEntry.Index, prevLogEntry.Term)
+			reply.NextLogIndex = rf.getLowerBoundIndexOfTerm(prevLogEntry.Term)
+			reply.NextLogTerm = prevLogEntry.Term
+		}
+		rf.logWriter.Printf("msgId[%d], reply with NextLogIndex[%d], NextLogTerm[%d]", args.MessageId, reply.NextLogIndex, reply.NextLogTerm)
 		rf.follow(args.LeaderId, args.Term)
 		rf.persist()
 		return
@@ -524,7 +541,8 @@ func (rf *Raft) broadcastHeartbeat() {
 		lastLogIndex := rf.getLastLogEntry().Index
 		prevLogIndex := rf.nextIndex[server] - 1
 		entries := rf.getLogEntries(prevLogIndex+1, lastLogIndex)
-		rf.logWriter.Printf("broadcast heartbeat to raft[%d], prevLogIndex[%d], log[%v]", server, prevLogIndex, rf.log)
+		messageId := rand.Int63()
+		rf.logWriter.Printf("msgId[%d], broadcast heartbeat to raft[%d], prevLogIndex[%d], log index[%v]", messageId, server, prevLogIndex, rf.getLastLogEntry().Index)
 		args := AppendEntriesArgs{
 			rf.currentTerm,
 			rf.me,
@@ -532,6 +550,7 @@ func (rf *Raft) broadcastHeartbeat() {
 			rf.getLogEntry(prevLogIndex).Term,
 			entries,
 			rf.commitIndex,
+			messageId,
 		}
 		go func(server int) {
 			reply := AppendEntriesReply{}
@@ -542,10 +561,13 @@ func (rf *Raft) broadcastHeartbeat() {
 				rf.mu.Lock()
 				defer rf.mu.Unlock()
 				if reply.Term <= rf.currentTerm {
-					if rf.nextIndex[server] - 1 == prevLogIndex {
+					if rf.nextIndex[server] == prevLogIndex + 1 {
 						// nextIndex is not changed (valid), back
 						// TODO : can optimize
-						rf.nextIndex[server] = prevLogIndex
+						rf.nextIndex[server] = reply.NextLogIndex
+						if reply.NextLogTerm != -1 {
+							rf.nextIndex[server] = min(rf.nextIndex[server], rf.getLowerBoundIndexOfTerm(reply.NextLogTerm))
+						}
 					}
 				} else {
 					rf.follow(-1, reply.Term)
@@ -689,6 +711,23 @@ func (rf *Raft) updateCommitIndex(index int) {
 
 func (rf *Raft) isStateEqual(state State) bool {
 	return atomic.LoadInt32((*int32)(&rf.state)) == int32(state)
+}
+
+func (rf *Raft) getLowerBoundIndexOfTerm(term int) int {
+	lower, upper := 0, rf.getLastLogEntry().Index
+	ans := upper
+	for lower <= upper {
+		mid := (lower + upper) / 2
+		if rf.getLogEntry(mid).Term < term {
+			lower = mid + 1
+		} else {
+			ans = mid
+			upper = mid - 1
+		}
+	}
+
+	rf.logWriter.Printf("get lower bound index [%d] with term[%d]", ans, term)
+	return ans
 }
 
 func randomElectionTimeout(lower time.Duration, upper time.Duration) time.Duration {
