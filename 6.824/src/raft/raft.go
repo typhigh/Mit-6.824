@@ -99,7 +99,7 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-	applyCh     chan ApplyMsg
+	applyCh        chan ApplyMsg
 	currentTerm    int
 	votedFor       int
 	state          State
@@ -144,7 +144,7 @@ func (rf *Raft) persist() {
 	encoder.Encode(rf.log)
 	data := wBuffer.Bytes()
 	rf.persister.SaveRaftState(data)
-	rf.logWriter.Printf("persist, currentTerm[%d], voteFor[%d], serialize log[%v]", rf.currentTerm, rf.votedFor, rf.log)
+	//rf.logWriter.Printf("persist, currentTerm[%d], voteFor[%d], serialize log[%v]", rf.currentTerm, rf.votedFor, rf.log)
 }
 
 
@@ -202,7 +202,20 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
+	lastIndex := rf.getLastLogEntry().Index
+	entries := rf.getLogEntries(index + 1, lastIndex)
+	rf.log = entries
+
+	wBuffer := new(bytes.Buffer)
+	encoder := labgob.NewEncoder(wBuffer)
+	encoder.Encode(rf.currentTerm)
+	encoder.Encode(rf.votedFor)
+	encoder.Encode(rf.log)
+	state := wBuffer.Bytes()
+	rf.persister.SaveStateAndSnapshot(state, snapshot)
 }
 
 // RequestVoteArgs
@@ -394,6 +407,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		rf.nextIndex[rf.me] = index + 1
 		rf.logWriter.Printf("leader start command [%v]", command)
 		rf.persist()
+		rf.broadcastHeartbeat()
 	}
 	return index, term, isLeader
 }
@@ -518,7 +532,7 @@ func (rf *Raft) startElection() {
 			if atomic.LoadInt32(&nVoteGranted) >= nMinLeaderVote {
 				rf.mu.Lock()
 				defer rf.mu.Unlock()
-				if !rf.isStateEqual(Leader) {
+				if rf.isStateEqual(Candidate) {
 					// ensure update leader exactly once
 					rf.updateState(Leader)
 				}
@@ -557,15 +571,20 @@ func (rf *Raft) broadcastHeartbeat() {
 			if !rf.sendAppendEntries(server, &args, &reply) {
 				return
 			}
+			rf.mu.Lock()
+			defer rf.mu.Unlock()
+			// make sure state stable
+			if !rf.isStateEqual(Leader) {
+				return
+			}
 			if reply.Success == false {
-				rf.mu.Lock()
-				defer rf.mu.Unlock()
 				if reply.Term <= rf.currentTerm {
 					if rf.nextIndex[server] == prevLogIndex + 1 {
 						// nextIndex is not changed (valid), back
 						// TODO : can optimize
 						rf.nextIndex[server] = reply.NextLogIndex
 						if reply.NextLogTerm != -1 {
+							// in this case, nextIndex[server] will not increment
 							rf.nextIndex[server] = min(rf.nextIndex[server], rf.getLowerBoundIndexOfTerm(reply.NextLogTerm))
 						}
 					}
@@ -576,8 +595,6 @@ func (rf *Raft) broadcastHeartbeat() {
 			}
 
 			// append entries success, update match and commitIndex, ensure match always increment
-			rf.mu.Lock()
-			defer rf.mu.Unlock()
 			if entries != nil && len(entries) > 0 {
 				rf.matchIndex[server] = max(rf.matchIndex[server], GetLastLogEntry(entries).Index)
 				rf.nextIndex[server] = rf.matchIndex[server] + 1
